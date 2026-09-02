@@ -5,7 +5,7 @@
 현재 프로젝트는 [Books to Scrape](https://books.toscrape.com/)를 대상으로 다음 두 실행 구조를 함께 제공합니다.
 
 - **로컬 파이프라인**: Crawling → Extract → Preprocess → Load → MySQL
-- **AWS 파이프라인(현재 구현 범위)**: Step Functions → Crawling Lambda → S3 Raw → Extract Lambda → S3 Interim → Preprocess Lambda → S3 Processed → Load Lambda → Amazon RDS MySQL
+- **AWS 파이프라인(현재 구현 범위)**: EventBridge Scheduler → Step Functions → Crawling Lambda → S3 Raw → Extract Lambda → S3 Interim → Preprocess Lambda → S3 Processed → Load Lambda → Amazon RDS MySQL
 
 또한 `pytest`, `Ruff`, GitHub Actions를 이용하여 코드 품질과 테스트를 자동으로 검증하고, AWS SAM과 CloudFormation을 이용하여 Lambda, S3, Step Functions 및 관련 IAM 구성을 배포합니다. Load 단계에서는 AWS Secrets Manager의 RDS 관리형 Secret과 VPC 네트워크 구성을 이용해 Private RDS MySQL에 안전하게 적재합니다.
 
@@ -23,6 +23,7 @@
 - Lambda 간에 대용량 데이터 자체를 전달하지 않고 `bucket`, `prefix`, `batch_id` 같은 메타데이터를 전달합니다.
 - 데이터 저장 전 필수 컬럼, 결측값, 중복값, 자료형을 검증합니다.
 - Step Functions를 이용해 Crawling, Extract, Preprocess, Load Lambda를 순차 실행합니다.
+- EventBridge Scheduler를 이용해 Step Functions 기반 전체 파이프라인을 정기 실행합니다.
 - `pytest`와 `Ruff`를 이용해 로컬에서 코드와 테스트를 검증합니다.
 - GitHub Actions를 이용해 `push`, `pull_request` 시 CI를 자동 실행합니다.
 - AWS SAM을 이용해 Lambda, IAM Role, S3 Bucket, Step Functions 상태 머신을 코드로 정의하고 배포합니다.
@@ -119,6 +120,8 @@ books 테이블 UPSERT
 현재 구현 완료 범위:
 
 ```text
+EventBridge Scheduler
+      ↓
 AWS Step Functions
       ↓
 Crawling Lambda
@@ -140,7 +143,7 @@ Amazon RDS MySQL
 
 다음 단계
       ↓
-EventBridge Scheduler
+GitHub Actions CD
 ```
 
 ---
@@ -701,7 +704,9 @@ Resources
 ├─ ExtractFunction
 ├─ PreprocessFunction
 ├─ LoadFunction
-└─ PipelineStateMachine
+├─ PipelineStateMachine
+├─ PipelineSchedulerRole
+└─ PipelineSchedule
 ```
 
 ### `DataBucket`
@@ -812,6 +817,64 @@ OutputPath: $.Payload
 
 Step Functions 실행 역할에는 각 Lambda를 호출하기 위한 `LambdaInvokePolicy`를 부여합니다.
 
+
+### `PipelineSchedulerRole`
+
+EventBridge Scheduler가 Step Functions 상태 머신을 실행할 수 있도록 사용하는 IAM Role입니다.
+
+주요 권한:
+
+```text
+scheduler.amazonaws.com
+      ↓
+sts:AssumeRole
+      ↓
+states:StartExecution
+      ↓
+books-pipeline-state-machine
+```
+
+### `PipelineSchedule`
+
+정해진 시간 또는 주기에 따라 Step Functions 상태 머신을 자동 실행하는 EventBridge Scheduler 리소스입니다.
+
+현재 Scheduler 이름:
+
+```text
+books-pipeline-schedule
+```
+
+주요 설정:
+
+```text
+Target
+→ books-pipeline-state-machine
+
+Target API
+→ SFN_StartExecution
+
+Timezone
+→ Asia/Seoul
+
+Input
+→ start_page / end_page
+```
+
+예를 들어 1시간 간격으로 실행하려면 다음 Rate 표현식을 사용할 수 있습니다.
+
+```text
+rate(1 hour)
+```
+
+매시 정각 실행이 필요하면 다음 Cron 표현식을 사용할 수 있습니다.
+
+```text
+cron(0 * * * ? *)
+```
+
+`ScheduleEnabled` Parameter를 이용해 Scheduler 활성화 여부를 제어할 수 있습니다.
+
+
 ---
 
 ## 9. Step Functions 오케스트레이션
@@ -882,7 +945,89 @@ AWS 콘솔에서 상태 머신을 실행하면 Crawling → Extract → Preproce
 
 ---
 
-## 10. Amazon RDS 및 VPC 네트워크 구성
+## 10. EventBridge Scheduler 자동 실행
+
+Step Functions 상태 머신은 EventBridge Scheduler에 의해 정해진 시간 또는 주기에 자동 실행할 수 있습니다.
+
+전체 자동 실행 구조:
+
+```text
+EventBridge Scheduler
+        ↓
+states:StartExecution
+        ↓
+Step Functions
+        ↓
+Crawling Lambda
+        ↓
+Extract Lambda
+        ↓
+Preprocess Lambda
+        ↓
+Load Lambda
+        ↓
+Amazon RDS MySQL
+```
+
+Scheduler가 Step Functions에 전달하는 최초 입력 예:
+
+```json
+{
+  "start_page": 1,
+  "end_page": 3
+}
+```
+
+현재 Scheduler 이름:
+
+```text
+books-pipeline-schedule
+```
+
+AWS 콘솔 확인 경로:
+
+```text
+Amazon EventBridge
+→ Scheduler
+→ 일정
+→ books-pipeline-schedule
+```
+
+확인 항목:
+
+```text
+상태
+→ 활성
+
+대상
+→ books-pipeline-state-machine
+
+대상 유형
+→ SFN_StartExecution
+
+실행 시간대
+→ Asia/Seoul
+```
+
+실제 자동 실행 여부는 Step Functions에서 확인합니다.
+
+```text
+Step Functions
+→ books-pipeline-state-machine
+→ 실행
+```
+
+Scheduler 실행 시 사람이 직접 시작하지 않아도 새로운 Execution이 생성되고 다음 흐름이 자동 수행됩니다.
+
+```text
+Crawling   ✅
+Extract    ✅
+Preprocess ✅
+Load       ✅
+```
+
+
+## 11. Amazon RDS 및 VPC 네트워크 구성
 
 Load Lambda는 Private Amazon RDS MySQL에 접근하기 위해 VPC에 연결합니다.
 
@@ -923,7 +1068,7 @@ RDS 마스터 자격 증명은 AWS Secrets Manager에서 관리하며 Lambda 코
 
 ---
 
-## 11. SAM 관리 S3와 데이터 S3의 차이
+## 12. SAM 관리 S3와 데이터 S3의 차이
 
 AWS 계정에는 SAM 배포 후 서로 다른 목적의 S3 Bucket이 보일 수 있습니다.
 
@@ -971,9 +1116,9 @@ Amazon RDS MySQL
 
 ---
 
-## 12. 환경 구성
+## 13. 환경 구성
 
-### 12.1 가상환경 생성
+### 13.1 가상환경 생성
 
 프로젝트 루트에서:
 
@@ -993,7 +1138,7 @@ Git Bash:
 source .venv/Scripts/activate
 ```
 
-### 12.2 실행 패키지 설치
+### 13.2 실행 패키지 설치
 
 ```bash
 python -m pip install --upgrade pip
@@ -1011,7 +1156,7 @@ SQLAlchemy
 PyMySQL
 ```
 
-### 12.3 개발 및 테스트 패키지 설치
+### 13.3 개발 및 테스트 패키지 설치
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -1024,7 +1169,7 @@ pytest
 ruff
 ```
 
-### 12.4 `.env` 설정
+### 13.4 `.env` 설정
 
 `.env.example`을 참고하여 로컬 `.env`를 작성합니다.
 
@@ -1040,7 +1185,7 @@ DB_PASSWORD=
 
 ---
 
-## 13. 로컬 파이프라인 실행
+## 14. 로컬 파이프라인 실행
 
 ```bash
 python main.py
@@ -1070,7 +1215,7 @@ main.py
 
 ---
 
-## 14. 테스트와 코드 품질 검사
+## 15. 테스트와 코드 품질 검사
 
 ### pytest
 
@@ -1124,7 +1269,7 @@ line-length: 100
 
 ---
 
-## 15. GitHub Actions CI
+## 16. GitHub Actions CI
 
 Workflow 위치:
 
@@ -1162,7 +1307,7 @@ CI 성공 / 실패
 
 ---
 
-## 16. AWS SAM 빌드 및 배포
+## 17. AWS SAM 빌드 및 배포
 
 프로젝트 파일 또는 `template.yaml`을 수정한 뒤 다음 순서로 검증합니다.
 
@@ -1201,9 +1346,9 @@ ap-northeast-2
 
 ---
 
-## 17. Lambda 원격 호출
+## 18. Lambda 원격 호출
 
-### 17.1 Crawling Lambda
+### 18.1 Crawling Lambda
 
 `events/crawling-event.json`:
 
@@ -1228,7 +1373,7 @@ sam remote invoke CrawlingFunction `
 raw/{batch_id}/
 ```
 
-### 17.2 Extract Lambda
+### 18.2 Extract Lambda
 
 `events/extract-event.json`은 **직전 Crawling Lambda의 실제 반환값**을 기준으로 작성합니다.
 
@@ -1254,7 +1399,7 @@ sam remote invoke ExtractFunction `
 interim/{batch_id}/
 ```
 
-### 17.3 Preprocess Lambda
+### 18.3 Preprocess Lambda
 
 `events/preprocess-event.json`은 **직전 Extract Lambda의 실제 반환값과 S3 Interim 경로**를 기준으로 작성합니다.
 
@@ -1280,7 +1425,7 @@ sam remote invoke PreprocessFunction `
 processed/{batch_id}/
 ```
 
-### 17.4 Load Lambda
+### 18.4 Load Lambda
 
 `events/load-event.json`은 **직전 Preprocess Lambda의 실제 반환값**을 기준으로 작성합니다.
 
@@ -1306,7 +1451,7 @@ sam remote invoke LoadFunction `
 
 ---
 
-## 18. Step Functions 실행
+## 19. Step Functions 실행
 
 AWS 콘솔에서 다음 상태 머신을 선택합니다.
 
@@ -1362,7 +1507,7 @@ stored_book_count
 
 ---
 
-## 19. Lambda `/var/task`와 `/tmp`
+## 20. Lambda `/var/task`와 `/tmp`
 
 Lambda 실행 환경에서 주요 경로의 역할은 다음과 같습니다.
 
@@ -1396,7 +1541,7 @@ Extract Lambda /tmp
 
 ---
 
-## 20. Git 관리 정책
+## 21. Git 관리 정책
 
 이 프로젝트는 블랙리스트 방식의 `.gitignore`를 사용합니다.
 
@@ -1433,7 +1578,7 @@ samconfig.toml
 
 
 
-## 21. 현재 구현 상태
+## 22. 현재 구현 상태
 
 ### 완료
 
@@ -1456,9 +1601,11 @@ AWS SAM
 → S3 DataBucket
 → Lambda Functions
 → Step Functions
+→ EventBridge Scheduler
 
 [AWS Data Pipeline]
-Step Functions
+EventBridge Scheduler
+→ Step Functions
 → Crawling Lambda
 → S3 Raw
 → Extract Lambda
@@ -1479,12 +1626,14 @@ Secrets Manager 기반 자격 증명 조회
 ### 다음 구현 단계
 
 ```text
-EventBridge Scheduler
+GitHub Actions
       ↓
-Step Functions 자동 실행
+AWS SAM 자동 배포
+      ↓
+CloudFormation Stack 업데이트
 ```
 
-그 이후에는 GitHub Actions와 AWS SAM 배포를 연결하여 CD 구조로 확장할 예정입니다.
+다음 단계에서는 현재 CI Workflow에 CD를 추가하여 `main` 브랜치 변경사항을 AWS에 자동 배포하는 구조로 확장할 예정입니다.
 
 ```text
 GitHub Push
@@ -1528,13 +1677,14 @@ RDS MySQL
 
 ---
 
-## 22. 설계 원칙
+## 23. 설계 원칙
 
 - 원본 데이터는 `raw` 영역에 보관합니다.
 - 한 번의 수집 실행을 하나의 `batch_id`로 관리합니다.
 - 단계 간 대용량 데이터는 S3에 저장합니다.
 - Lambda 간에는 `batch_id`, `bucket`, `prefix` 등의 메타데이터를 전달합니다.
 - Step Functions는 각 Lambda의 실행 순서와 단계 간 메타데이터 전달을 담당합니다.
+- EventBridge Scheduler는 정해진 시간 또는 주기에 Step Functions 상태 머신 실행을 시작합니다.
 - Lambda의 `/tmp`는 임시 작업 공간으로만 사용합니다.
 - 각 Lambda Handler는 실행 제어에 집중하고 실제 데이터 처리 로직은 `src/` 모듈을 재사용합니다.
 - 공통 설정은 `config.py`에서 관리합니다.
