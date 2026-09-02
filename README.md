@@ -5,9 +5,9 @@
 현재 프로젝트는 [Books to Scrape](https://books.toscrape.com/)를 대상으로 다음 두 실행 구조를 함께 제공합니다.
 
 - **로컬 파이프라인**: Crawling → Extract → Preprocess → Load → MySQL
-- **AWS 파이프라인(현재 구현 범위)**: Crawling Lambda → S3 Raw → Extract Lambda → S3 Interim → Preprocess Lambda → S3 Processed → Load Lambda → Amazon RDS MySQL
+- **AWS 파이프라인(현재 구현 범위)**: Step Functions → Crawling Lambda → S3 Raw → Extract Lambda → S3 Interim → Preprocess Lambda → S3 Processed → Load Lambda → Amazon RDS MySQL
 
-또한 `pytest`, `Ruff`, GitHub Actions를 이용하여 코드 품질과 테스트를 자동으로 검증하고, AWS SAM과 CloudFormation을 이용하여 Lambda와 S3 리소스를 배포합니다. Load 단계에서는 AWS Secrets Manager의 RDS 관리형 Secret과 VPC 네트워크 구성을 이용해 Private RDS MySQL에 안전하게 적재합니다.
+또한 `pytest`, `Ruff`, GitHub Actions를 이용하여 코드 품질과 테스트를 자동으로 검증하고, AWS SAM과 CloudFormation을 이용하여 Lambda, S3, Step Functions 및 관련 IAM 구성을 배포합니다. Load 단계에서는 AWS Secrets Manager의 RDS 관리형 Secret과 VPC 네트워크 구성을 이용해 Private RDS MySQL에 안전하게 적재합니다.
 
 ---
 
@@ -22,9 +22,10 @@
 - AWS 환경에서는 Lambda별 책임을 분리하고 S3를 단계 간 데이터 저장소로 사용합니다.
 - Lambda 간에 대용량 데이터 자체를 전달하지 않고 `bucket`, `prefix`, `batch_id` 같은 메타데이터를 전달합니다.
 - 데이터 저장 전 필수 컬럼, 결측값, 중복값, 자료형을 검증합니다.
+- Step Functions를 이용해 Crawling, Extract, Preprocess, Load Lambda를 순차 실행합니다.
 - `pytest`와 `Ruff`를 이용해 로컬에서 코드와 테스트를 검증합니다.
 - GitHub Actions를 이용해 `push`, `pull_request` 시 CI를 자동 실행합니다.
-- AWS SAM을 이용해 Lambda, IAM Role, S3 Bucket을 코드로 정의하고 배포합니다.
+- AWS SAM을 이용해 Lambda, IAM Role, S3 Bucket, Step Functions 상태 머신을 코드로 정의하고 배포합니다.
 
 ---
 
@@ -68,10 +69,10 @@ run_load()
 
 ### 2.2 AWS 파이프라인 - 현재 구현 상태
 
-현재 AWS 환경에서는 Crawling, Extract, Preprocess, Load 단계를 각각 Lambda로 분리했습니다.
+AWS 환경에서는 Crawling, Extract, Preprocess, Load 단계를 각각 Lambda로 분리하고, Step Functions가 각 Lambda를 순차 실행합니다.
 
 ```text
-Books to Scrape
+AWS Step Functions
        ↓
 Crawling Lambda
        ↓
@@ -118,6 +119,8 @@ books 테이블 UPSERT
 현재 구현 완료 범위:
 
 ```text
+AWS Step Functions
+      ↓
 Crawling Lambda
       ↓
 S3 Raw
@@ -136,8 +139,6 @@ Amazon RDS MySQL
       ✅ 완료
 
 다음 단계
-      ↓
-AWS Step Functions
       ↓
 EventBridge Scheduler
 ```
@@ -538,7 +539,7 @@ S3 interim/{batch_id}/ 업로드
 }
 ```
 
-향후 Step Functions에서는 이 반환값의 메타데이터를 다음 단계로 전달할 예정입니다.
+이 반환값은 Step Functions에서 다음 Preprocess 단계의 입력으로 전달됩니다.
 
 
 ### 5.3 `preprocess_handler.py`
@@ -699,7 +700,8 @@ Resources
 ├─ CrawlingFunction
 ├─ ExtractFunction
 ├─ PreprocessFunction
-└─ LoadFunction
+├─ LoadFunction
+└─ PipelineStateMachine
 ```
 
 ### `DataBucket`
@@ -778,10 +780,109 @@ VpcConfig
 
 계정마다 달라지는 RDS Endpoint, Secret ARN, Subnet ID, Security Group ID는 SAM Parameter로 전달합니다.
 
+### `PipelineStateMachine`
+
+Crawling, Extract, Preprocess, Load Lambda를 순서대로 실행하는 AWS Step Functions 상태 머신입니다.
+
+상태 흐름:
+
+```text
+Start
+  ↓
+Crawling
+  ↓
+Extract
+  ↓
+Preprocess
+  ↓
+Load
+  ↓
+End
+```
+
+각 Task는 `arn:aws:states:::lambda:invoke`를 사용하여 Lambda를 동기 호출합니다.
+
+```text
+Payload.$: $
+→ 현재 State의 전체 입력을 Lambda Event로 전달
+
+OutputPath: $.Payload
+→ Lambda 호출 결과 중 실제 Payload만 다음 State로 전달
+```
+
+Step Functions 실행 역할에는 각 Lambda를 호출하기 위한 `LambdaInvokePolicy`를 부여합니다.
 
 ---
 
-## 9. Amazon RDS 및 VPC 네트워크 구성
+## 9. Step Functions 오케스트레이션
+
+현재 전체 AWS 파이프라인은 Step Functions가 순차 실행합니다.
+
+최초 실행 입력 예:
+
+```json
+{
+  "start_page": 1,
+  "end_page": 3
+}
+```
+
+데이터 전달 흐름:
+
+```text
+Step Functions 최초 입력
+{
+  start_page,
+  end_page
+}
+        ↓
+Crawling Lambda
+        ↓
+{
+  batch_id,
+  bucket,
+  raw_prefix
+}
+        ↓
+Extract Lambda
+        ↓
+{
+  batch_id,
+  bucket,
+  interim_prefix
+}
+        ↓
+Preprocess Lambda
+        ↓
+{
+  batch_id,
+  bucket,
+  processed_key
+}
+        ↓
+Load Lambda
+        ↓
+{
+  stage,
+  status,
+  batch_id,
+  load_summary
+}
+```
+
+Step Functions는 대용량 데이터 자체를 전달하지 않고, 각 단계에서 필요한 S3 위치 정보와 배치 메타데이터만 전달합니다.
+
+현재 상태 머신 이름:
+
+```text
+books-pipeline-state-machine
+```
+
+AWS 콘솔에서 상태 머신을 실행하면 Crawling → Extract → Preprocess → Load 순서로 각 상태의 성공 여부를 확인할 수 있습니다.
+
+---
+
+## 10. Amazon RDS 및 VPC 네트워크 구성
 
 Load Lambda는 Private Amazon RDS MySQL에 접근하기 위해 VPC에 연결합니다.
 
@@ -822,7 +923,7 @@ RDS 마스터 자격 증명은 AWS Secrets Manager에서 관리하며 Lambda 코
 
 ---
 
-## 10. SAM 관리 S3와 데이터 S3의 차이
+## 11. SAM 관리 S3와 데이터 S3의 차이
 
 AWS 계정에는 SAM 배포 후 서로 다른 목적의 S3 Bucket이 보일 수 있습니다.
 
@@ -843,7 +944,7 @@ SAM 관리 S3 Bucket
    ↓
 CloudFormation
    ↓
-Lambda
+Lambda / Step Functions
 ```
 
 반면 `DataBucket`은 애플리케이션 데이터 저장용입니다.
@@ -860,15 +961,19 @@ DataBucket/interim/
 Preprocess Lambda
       ↓
 DataBucket/processed/
+      ↓
+Load Lambda
+      ↓
+Amazon RDS MySQL
 ```
 
 두 Bucket의 목적을 구분하여 사용합니다.
 
 ---
 
-## 11. 환경 구성
+## 12. 환경 구성
 
-### 10.1 가상환경 생성
+### 12.1 가상환경 생성
 
 프로젝트 루트에서:
 
@@ -888,7 +993,7 @@ Git Bash:
 source .venv/Scripts/activate
 ```
 
-### 10.2 실행 패키지 설치
+### 12.2 실행 패키지 설치
 
 ```bash
 python -m pip install --upgrade pip
@@ -906,7 +1011,7 @@ SQLAlchemy
 PyMySQL
 ```
 
-### 10.3 개발 및 테스트 패키지 설치
+### 12.3 개발 및 테스트 패키지 설치
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -919,7 +1024,7 @@ pytest
 ruff
 ```
 
-### 10.4 `.env` 설정
+### 12.4 `.env` 설정
 
 `.env.example`을 참고하여 로컬 `.env`를 작성합니다.
 
@@ -935,7 +1040,7 @@ DB_PASSWORD=
 
 ---
 
-## 12. 로컬 파이프라인 실행
+## 13. 로컬 파이프라인 실행
 
 ```bash
 python main.py
@@ -965,7 +1070,7 @@ main.py
 
 ---
 
-## 13. 테스트와 코드 품질 검사
+## 14. 테스트와 코드 품질 검사
 
 ### pytest
 
@@ -1019,7 +1124,7 @@ line-length: 100
 
 ---
 
-## 14. GitHub Actions CI
+## 15. GitHub Actions CI
 
 Workflow 위치:
 
@@ -1057,7 +1162,7 @@ CI 성공 / 실패
 
 ---
 
-## 15. AWS SAM 빌드 및 배포
+## 16. AWS SAM 빌드 및 배포
 
 프로젝트 파일 또는 `template.yaml`을 수정한 뒤 다음 순서로 검증합니다.
 
@@ -1096,9 +1201,9 @@ ap-northeast-2
 
 ---
 
-## 16. Lambda 원격 호출
+## 17. Lambda 원격 호출
 
-### 16.1 Crawling Lambda
+### 17.1 Crawling Lambda
 
 `events/crawling-event.json`:
 
@@ -1123,7 +1228,7 @@ sam remote invoke CrawlingFunction `
 raw/{batch_id}/
 ```
 
-### 16.2 Extract Lambda
+### 17.2 Extract Lambda
 
 `events/extract-event.json`은 **직전 Crawling Lambda의 실제 반환값**을 기준으로 작성합니다.
 
@@ -1149,7 +1254,7 @@ sam remote invoke ExtractFunction `
 interim/{batch_id}/
 ```
 
-### 16.3 Preprocess Lambda
+### 17.3 Preprocess Lambda
 
 `events/preprocess-event.json`은 **직전 Extract Lambda의 실제 반환값과 S3 Interim 경로**를 기준으로 작성합니다.
 
@@ -1175,7 +1280,7 @@ sam remote invoke PreprocessFunction `
 processed/{batch_id}/
 ```
 
-### 16.4 Load Lambda
+### 17.4 Load Lambda
 
 `events/load-event.json`은 **직전 Preprocess Lambda의 실제 반환값**을 기준으로 작성합니다.
 
@@ -1201,7 +1306,63 @@ sam remote invoke LoadFunction `
 
 ---
 
-## 17. Lambda `/var/task`와 `/tmp`
+## 18. Step Functions 실행
+
+AWS 콘솔에서 다음 상태 머신을 선택합니다.
+
+```text
+books-pipeline-state-machine
+```
+
+실행 입력:
+
+```json
+{
+  "start_page": 1,
+  "end_page": 3
+}
+```
+
+정상 실행 흐름:
+
+```text
+Start
+  ↓
+Crawling   ✅
+  ↓
+Extract    ✅
+  ↓
+Preprocess ✅
+  ↓
+Load       ✅
+  ↓
+End
+```
+
+각 단계의 입력/출력에서 `batch_id`, `bucket`, `raw_prefix`, `interim_prefix`, `processed_key`가 다음 Lambda로 전달되는지 확인할 수 있습니다.
+
+최종 Load 상태 출력에서는 RDS 적재 결과를 확인합니다.
+
+```text
+status
+→ SUCCEEDED
+
+database_name
+→ booksdb
+
+input_count
+→ 입력 CSV 행 수
+
+affected_row_count
+→ MySQL 드라이버 영향 행 수
+
+stored_book_count
+→ SELECT COUNT(*) FROM books 결과
+```
+
+---
+
+## 19. Lambda `/var/task`와 `/tmp`
 
 Lambda 실행 환경에서 주요 경로의 역할은 다음과 같습니다.
 
@@ -1235,7 +1396,7 @@ Extract Lambda /tmp
 
 ---
 
-## 18. Git 관리 정책
+## 20. Git 관리 정책
 
 이 프로젝트는 블랙리스트 방식의 `.gitignore`를 사용합니다.
 
@@ -1272,7 +1433,7 @@ samconfig.toml
 
 
 
-## 19. 현재 구현 상태
+## 21. 현재 구현 상태
 
 ### 완료
 
@@ -1289,18 +1450,28 @@ pytest
 → Ruff
 → GitHub Actions CI
 
-[AWS]
+[AWS Infrastructure]
 AWS SAM
 → CloudFormation
+→ S3 DataBucket
+→ Lambda Functions
+→ Step Functions
+
+[AWS Data Pipeline]
+Step Functions
 → Crawling Lambda
-→ S3 Raw 저장
+→ S3 Raw
 → Extract Lambda
-→ S3 Interim 저장
+→ S3 Interim
 → Preprocess Lambda
-→ S3 Processed 저장
+→ S3 Processed
 → Load Lambda
 → Amazon RDS MySQL
-→ Secrets Manager 기반 자격 증명 조회
+
+[Security / Network]
+Secrets Manager 기반 자격 증명 조회
+→ Load Lambda VPC 연결
+→ RDS Security Group
 → S3 Gateway VPC Endpoint
 → Secrets Manager Interface VPC Endpoint
 ```
@@ -1308,18 +1479,30 @@ AWS SAM
 ### 다음 구현 단계
 
 ```text
-AWS Step Functions
+EventBridge Scheduler
       ↓
-Crawling Lambda
-      ↓
-Extract Lambda
-      ↓
-Preprocess Lambda
-      ↓
-Load Lambda
+Step Functions 자동 실행
 ```
 
-그 이후에는 EventBridge Scheduler를 연결하여 전체 파이프라인을 정기 실행 구조로 확장할 예정입니다.
+그 이후에는 GitHub Actions와 AWS SAM 배포를 연결하여 CD 구조로 확장할 예정입니다.
+
+```text
+GitHub Push
+      ↓
+GitHub Actions
+      ↓
+Ruff / pytest
+      ↓
+SAM Build
+      ↓
+SAM Deploy
+      ↓
+CloudFormation
+      ↓
+AWS 리소스 업데이트
+```
+
+최종 목표 구조:
 
 ```text
 EventBridge Scheduler
@@ -1345,12 +1528,13 @@ RDS MySQL
 
 ---
 
-## 20. 설계 원칙
+## 22. 설계 원칙
 
 - 원본 데이터는 `raw` 영역에 보관합니다.
 - 한 번의 수집 실행을 하나의 `batch_id`로 관리합니다.
 - 단계 간 대용량 데이터는 S3에 저장합니다.
 - Lambda 간에는 `batch_id`, `bucket`, `prefix` 등의 메타데이터를 전달합니다.
+- Step Functions는 각 Lambda의 실행 순서와 단계 간 메타데이터 전달을 담당합니다.
 - Lambda의 `/tmp`는 임시 작업 공간으로만 사용합니다.
 - 각 Lambda Handler는 실행 제어에 집중하고 실제 데이터 처리 로직은 `src/` 모듈을 재사용합니다.
 - 공통 설정은 `config.py`에서 관리합니다.
