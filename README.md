@@ -7,7 +7,7 @@
 - **로컬 파이프라인**: Crawling → Extract → Preprocess → Load → MySQL
 - **AWS 파이프라인(현재 구현 범위)**: EventBridge Scheduler → Step Functions → Crawling Lambda → S3 Raw → Extract Lambda → S3 Interim → Preprocess Lambda → S3 Processed → Load Lambda → Amazon RDS MySQL
 
-또한 `pytest`, `Ruff`, GitHub Actions를 이용하여 코드 품질과 테스트를 자동으로 검증하고, AWS SAM과 CloudFormation을 이용하여 Lambda, S3, Step Functions 및 관련 IAM 구성을 배포합니다. Load 단계에서는 AWS Secrets Manager의 RDS 관리형 Secret과 VPC 네트워크 구성을 이용해 Private RDS MySQL에 안전하게 적재합니다.
+또한 `pytest`, `Ruff`, GitHub Actions를 이용하여 코드 품질과 테스트를 자동으로 검증하고, CI 성공 후 GitHub Actions CD가 OIDC로 AWS IAM Role을 Assume하여 AWS SAM과 CloudFormation 기반 자동 배포를 수행합니다. Load 단계에서는 AWS Secrets Manager의 RDS 관리형 Secret과 VPC 네트워크 구성을 이용해 Private RDS MySQL에 안전하게 적재합니다.
 
 ---
 
@@ -26,7 +26,8 @@
 - EventBridge Scheduler를 이용해 Step Functions 기반 전체 파이프라인을 정기 실행합니다.
 - `pytest`와 `Ruff`를 이용해 로컬에서 코드와 테스트를 검증합니다.
 - GitHub Actions를 이용해 `push`, `pull_request` 시 CI를 자동 실행합니다.
-- AWS SAM을 이용해 Lambda, IAM Role, S3 Bucket, Step Functions 상태 머신을 코드로 정의하고 배포합니다.
+- CI가 성공하면 GitHub Actions CD가 OIDC로 AWS에 인증하고 AWS SAM 배포를 자동 수행합니다.
+- AWS SAM을 이용해 Lambda, IAM Role, S3 Bucket, Step Functions 상태 머신, EventBridge Scheduler를 코드로 정의하고 배포합니다.
 
 ---
 
@@ -120,30 +121,44 @@ books 테이블 UPSERT
 현재 구현 완료 범위:
 
 ```text
-EventBridge Scheduler
-      ↓
-AWS Step Functions
-      ↓
-Crawling Lambda
-      ↓
-S3 Raw
-      ↓
-Extract Lambda
-      ↓
-S3 Interim
-      ↓
-Preprocess Lambda
-      ↓
-S3 Processed
-      ↓
-Load Lambda
-      ↓
-Amazon RDS MySQL
-      ✅ 완료
-
-다음 단계
-      ↓
+GitHub Push / Pull Request
+        ↓
+GitHub Actions CI
+        ↓
+Ruff / pytest
+        ↓
+CI 성공
+        ↓
 GitHub Actions CD
+        ↓
+GitHub OIDC
+        ↓
+AWS IAM Deploy Role
+        ↓
+SAM Validate / Build / Deploy
+        ↓
+CloudFormation Stack 업데이트
+        ↓
+EventBridge Scheduler
+        ↓
+AWS Step Functions
+        ↓
+Crawling Lambda
+        ↓
+S3 Raw
+        ↓
+Extract Lambda
+        ↓
+S3 Interim
+        ↓
+Preprocess Lambda
+        ↓
+S3 Processed
+        ↓
+Load Lambda
+        ↓
+Amazon RDS MySQL
+        ✅ 완료
 ```
 
 ---
@@ -155,7 +170,8 @@ data-collection-pipeline/
 │
 ├─ .github/
 │  └─ workflows/
-│     └─ ci.yml
+│     ├─ ci.yml
+│     └─ deploy.yml
 │
 ├─ events/
 │  ├─ crawling-event.json
@@ -860,17 +876,16 @@ Input
 → start_page / end_page
 ```
 
-예를 들어 1시간 간격으로 실행하려면 다음 Rate 표현식을 사용할 수 있습니다.
+실행 주기는 `ScheduleExpression` Parameter로 지정할 수 있습니다.
+
+예:
 
 ```text
-rate(1 hour)
+rate(<value> <unit>)
+cron(<cron-expression>)
 ```
 
-매시 정각 실행이 필요하면 다음 Cron 표현식을 사용할 수 있습니다.
-
-```text
-cron(0 * * * ? *)
-```
+실제 운영 주기는 배포 환경과 수집 정책에 맞게 설정합니다.
 
 `ScheduleEnabled` Parameter를 이용해 Scheduler 활성화 여부를 제어할 수 있습니다.
 
@@ -1303,11 +1318,142 @@ pytest 실행
 CI 성공 / 실패
 ```
 
-현재 GitHub Actions는 **CI 코드 검사와 테스트**를 담당합니다. AWS 배포는 아직 `sam deploy`를 이용해 수동으로 수행합니다.
+CI가 성공하면 별도의 CD Workflow가 실행됩니다.
+
+```text
+CI 성공
+   ↓
+CD Workflow
+```
+
+CI와 CD를 분리하여 테스트가 실패한 Commit은 AWS에 배포되지 않도록 구성합니다.
 
 ---
 
-## 17. AWS SAM 빌드 및 배포
+## 17. GitHub Actions CD
+
+Workflow 위치:
+
+```text
+.github/workflows/deploy.yml
+```
+
+CD는 `main` 브랜치에서 실행된 CI Workflow가 성공한 경우에만 실행됩니다.
+
+```text
+main push
+    ↓
+GitHub Actions CI
+    ↓
+Ruff / pytest
+    ↓
+CI 성공
+    ↓
+GitHub Actions CD
+```
+
+CD Workflow는 CI에서 검증한 동일 Commit SHA를 Checkout합니다.
+
+```text
+github.event.workflow_run.head_sha
+```
+
+이를 통해 CI에서 검증하지 않은 다른 Commit이 배포되는 것을 방지합니다.
+
+### GitHub OIDC 기반 AWS 인증
+
+장기 Access Key를 GitHub에 저장하지 않고 GitHub OIDC를 이용합니다.
+
+```text
+GitHub Actions
+      ↓
+OIDC Token
+      ↓
+AWS STS
+      ↓
+sts:AssumeRoleWithWebIdentity
+      ↓
+books-pipeline-github-deploy-role
+```
+
+Workflow에는 OIDC Token 발급을 위해 다음 권한을 사용합니다.
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+```
+
+AWS IAM Role의 신뢰 정책에서는 특정 GitHub Repository와 `main` 브랜치만 Role을 Assume할 수 있도록 제한합니다.
+
+### GitHub Repository Variables
+
+계정 또는 환경마다 달라지는 배포 값은 GitHub Repository Variables로 관리합니다.
+
+```text
+AWS_ROLE_ARN
+AWS_REGION
+DB_HOST
+DB_SECRET_ARN
+LOAD_SUBNET_ID
+LOAD_SECURITY_GROUP_ID
+```
+
+DB 비밀번호 자체는 GitHub에 저장하지 않습니다.
+
+```text
+GitHub Actions
+      ↓
+DB_SECRET_ARN
+      ↓
+AWS Secrets Manager
+      ↓
+RDS username / password
+```
+
+### CD 실행 흐름
+
+```text
+Checkout Repository
+      ↓
+Python 3.13 설정
+      ↓
+AWS SAM CLI 설치
+      ↓
+GitHub OIDC → AWS IAM Role 인증
+      ↓
+aws sts get-caller-identity
+      ↓
+sam validate
+      ↓
+sam build
+      ↓
+sam deploy
+      ↓
+CloudFormation Stack 업데이트
+```
+
+현재 Stack:
+
+```text
+books-pipeline
+```
+
+현재 Region:
+
+```text
+ap-northeast-2
+```
+
+CD 배포에 성공하면 GitHub Actions 로그에서 다음 메시지를 확인할 수 있습니다.
+
+```text
+Successfully created/updated stack - books-pipeline in ap-northeast-2
+```
+
+---
+
+## 19. AWS SAM 빌드 및 배포
 
 프로젝트 파일 또는 `template.yaml`을 수정한 뒤 다음 순서로 검증합니다.
 
@@ -1346,7 +1492,7 @@ ap-northeast-2
 
 ---
 
-## 18. Lambda 원격 호출
+## 19. Lambda 원격 호출
 
 ### 18.1 Crawling Lambda
 
@@ -1451,7 +1597,7 @@ sam remote invoke LoadFunction `
 
 ---
 
-## 19. Step Functions 실행
+## 20. Step Functions 실행
 
 AWS 콘솔에서 다음 상태 머신을 선택합니다.
 
@@ -1507,7 +1653,7 @@ stored_book_count
 
 ---
 
-## 20. Lambda `/var/task`와 `/tmp`
+## 21. Lambda `/var/task`와 `/tmp`
 
 Lambda 실행 환경에서 주요 경로의 역할은 다음과 같습니다.
 
@@ -1541,7 +1687,7 @@ Extract Lambda /tmp
 
 ---
 
-## 21. Git 관리 정책
+## 22. Git 관리 정책
 
 이 프로젝트는 블랙리스트 방식의 `.gitignore`를 사용합니다.
 
@@ -1578,7 +1724,7 @@ samconfig.toml
 
 
 
-## 22. 현재 구현 상태
+## 23. 현재 구현 상태
 
 ### 완료
 
@@ -1591,9 +1737,19 @@ Crawling
 → MySQL
 
 [Code Quality / CI]
-pytest
-→ Ruff
+Ruff
+→ pytest
 → GitHub Actions CI
+
+[CD]
+CI 성공
+→ GitHub Actions CD
+→ GitHub OIDC
+→ AWS IAM Deploy Role
+→ SAM Validate
+→ SAM Build
+→ SAM Deploy
+→ CloudFormation Stack 업데이트
 
 [AWS Infrastructure]
 AWS SAM
@@ -1616,68 +1772,59 @@ EventBridge Scheduler
 → Amazon RDS MySQL
 
 [Security / Network]
-Secrets Manager 기반 자격 증명 조회
+GitHub OIDC 기반 AWS 인증
+→ Secrets Manager 기반 DB 자격 증명 조회
 → Load Lambda VPC 연결
 → RDS Security Group
 → S3 Gateway VPC Endpoint
 → Secrets Manager Interface VPC Endpoint
 ```
 
-### 다음 구현 단계
+현재 CI/CD를 포함한 AWS 데이터 수집 파이프라인의 기본 구현이 완료되었습니다.
+
+전체 자동화 구조:
 
 ```text
-GitHub Actions
-      ↓
-AWS SAM 자동 배포
-      ↓
-CloudFormation Stack 업데이트
-```
-
-다음 단계에서는 현재 CI Workflow에 CD를 추가하여 `main` 브랜치 변경사항을 AWS에 자동 배포하는 구조로 확장할 예정입니다.
-
-```text
-GitHub Push
-      ↓
-GitHub Actions
-      ↓
+Developer
+    ↓
+git push
+    ↓
+GitHub Actions CI
+    ↓
 Ruff / pytest
-      ↓
-SAM Build
-      ↓
-SAM Deploy
-      ↓
-CloudFormation
-      ↓
+    ↓
+CI 성공
+    ↓
+GitHub Actions CD
+    ↓
+OIDC
+    ↓
+AWS IAM Role
+    ↓
+SAM / CloudFormation
+    ↓
 AWS 리소스 업데이트
-```
 
-최종 목표 구조:
-
-```text
 EventBridge Scheduler
-        ↓
+    ↓
 Step Functions
-        ↓
-Crawling Lambda
-        ↓
-S3 Raw
-        ↓
-Extract Lambda
-        ↓
-S3 Interim
-        ↓
-Preprocess Lambda
-        ↓
-S3 Processed
-        ↓
-Load Lambda
-        ↓
-RDS MySQL
+    ↓
+Crawling
+    ↓
+Extract
+    ↓
+Preprocess
+    ↓
+Load
+    ↓
+Amazon RDS MySQL
 ```
+
+향후 확장 시에는 실패 재시도, 예외 처리, 모니터링 및 알림 등을 추가할 수 있습니다.
 
 ---
 
-## 23. 설계 원칙
+## 24. 설계 원칙
 
 - 원본 데이터는 `raw` 영역에 보관합니다.
 - 한 번의 수집 실행을 하나의 `batch_id`로 관리합니다.
@@ -1695,4 +1842,7 @@ RDS MySQL
 - AWS S3 입출력 책임은 `s3_storage.py`에서 관리합니다.
 - 테스트에서는 외부 네트워크 및 AWS 의존성을 가능한 한 Mock으로 분리합니다.
 - 로컬과 CI에서 동일한 Ruff/pytest 명령을 사용합니다.
+- CI가 성공한 Commit만 CD를 통해 AWS에 배포합니다.
+- GitHub Actions의 AWS 인증에는 장기 Access Key 대신 OIDC를 사용합니다.
+- 계정별 배포 값은 GitHub Repository Variables로 분리합니다.
 - AWS 리소스는 `template.yaml`을 기준으로 재현 가능하게 관리합니다.
